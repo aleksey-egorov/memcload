@@ -1,8 +1,9 @@
 package main
 
 import (
+	"archive/tar"
 	"flag"
-	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -63,5 +64,25 @@ func process(job *Job) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	fmt.Println(files)
+	for _, file := range files {
+		Info.Println("File ", file)
+		gzf, err := os.Open(file)
+		if err != nil {
+			Error.Println(err)
+		}
+
+		tarReader := tar.NewReader(gzf)
+
+		i := 0
+		for {
+			header, err := tarReader.Next()
+
+			if err == io.EOF {
+				break
+			}
+			Info.Println("Line: ", header)
+
+		}
+
+	}
 }
