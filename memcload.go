@@ -1,9 +1,13 @@
 package main
 
 import (
+	"./appsinstalled"
 	"bufio"
 	"compress/gzip"
 	"flag"
+	"fmt"
+	"github.com/bradfitz/gomemcache/memcache"
+	"github.com/golang/protobuf/proto"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,6 +18,7 @@ import (
 var (
 	Info  *log.Logger
 	Error *log.Logger
+	Debug *log.Logger
 )
 
 type Job struct {
@@ -33,7 +38,7 @@ type Appsinstalled struct {
 	dev_id   string
 	lat      float64
 	lon      float64
-	raw_apps []int
+	apps     []uint32
 }
 
 func main() {
@@ -50,6 +55,7 @@ func main() {
 
 	Info = log.New(os.Stdout, "I: ", log.Ldate|log.Ltime|log.Lshortfile)
 	Error = log.New(os.Stdout, "E: ", log.Ldate|log.Ltime|log.Lshortfile)
+	Debug = log.New(os.Stdout, "D: ", log.Ldate|log.Ltime|log.Lshortfile)
 
 	if *logfile != "" {
 		f, err := os.OpenFile(*logfile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
@@ -73,6 +79,8 @@ func check_err(e error) {
 func process(job *Job) {
 
 	var errors int
+	var processed int
+	var memc_addr string
 
 	device_memc := map[string]string{
 		"idfa": job.idfa,
@@ -100,30 +108,56 @@ func process(job *Job) {
 		//fmt.Println(buf)
 		//fmt.Println(n)
 
-		//for {
-		cr := bufio.NewReader(gr)
-		barr, _, err := cr.ReadLine()
-		check_err(err)
+		sc := bufio.NewScanner(gr)
+		for sc.Scan() {
 
-		appsinstalled := parse_appsinstalled(barr)
-		if appsinstalled == nil {
-			errors += 1
-			continue
+			line := sc.Text()
+			line = strings.Trim(line, " ")
+
+			appsinstalled := parse_appsinstalled(line)
+
+			if appsinstalled == nil {
+				errors += 1
+				continue
+			}
+
+			memc_addr = device_memc[appsinstalled.dev_type]
+			if memc_addr == "" {
+				errors += 1
+				Error.Println("Unknown device type: ", appsinstalled.dev_type)
+				continue
+			}
+			ok := insert_appsinstalled(memc_addr, appsinstalled, false)
+			if ok {
+				processed += 1
+			} else {
+				errors += 1
+			}
 		}
 
-		memc_addr := device_memc[appsinstalled.dev_type]
-		Info.Println(memc_addr)
+		/*if not processed:
+		fd.close()
+		dot_rename(fn)
+		continue
+
+		err_rate = float(errors) / processed
+		if err_rate < NORMAL_ERR_RATE:
+		logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
+		else:
+		logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
+		fd.close()
+		dot_rename(fn)
+		*/
 
 		//}
 
 	}
 }
 
-func parse_appsinstalled(barr []byte) *Appsinstalled {
+func parse_appsinstalled(str string) *Appsinstalled {
 
-	var apps []int
+	var apps []uint32
 
-	str := string(barr[:])
 	str = strings.TrimSpace(str)
 	line_parts := strings.Split(str, "\t")
 
@@ -145,7 +179,7 @@ func parse_appsinstalled(barr []byte) *Appsinstalled {
 		a = strings.TrimSpace(a)
 		digit, err := strconv.Atoi(a)
 		check_err(err)
-		apps = append(apps, digit)
+		apps = append(apps, uint32(digit))
 	}
 
 	lat, err := strconv.ParseFloat(lat_str, 8)
@@ -155,23 +189,33 @@ func parse_appsinstalled(barr []byte) *Appsinstalled {
 
 	return &Appsinstalled{dev_type, dev_id, lat, lon, apps}
 
-	/*def parse_appsinstalled(line):
-	line_parts = line.decode("utf-8").strip().split("\t")
-	if len(line_parts) < 5:
-	return
-	dev_type, dev_id, lat, lon, raw_apps = line_parts
-	if not dev_type or not dev_id:
-	return
-	try:
+}
 
-	apps = [int(a.strip()) for a in raw_apps.split(",")]
-	except ValueError:
-	apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
-	logging.info("Not all user apps are digits: `%s`" % line)
-	try:
+func insert_appsinstalled(memc_addr string, apps_installed *Appsinstalled, dry_run bool) bool {
 
-		lat, lon = float(lat), float(lon)
-	except ValueError:
-	logging.info("Invalid geo coords: `%s`" % line)
-	return AppsInstalled(dev_type, dev_id, lat, lon, apps) */
+	ua := &appsinstalled.UserApps{
+		Lat:  proto.Float64(apps_installed.lat),
+		Lon:  proto.Float64(apps_installed.lon),
+		Apps: apps_installed.apps,
+	}
+
+	key := fmt.Sprintf("%s:%s", apps_installed.dev_type, apps_installed.dev_id)
+	packed, _ := proto.Marshal(ua)
+
+	if dry_run {
+		Debug.Println("%s - %s -> %s", memc_addr, key, ua.String())
+	} else {
+		mc := memcache.New(memc_addr)
+
+		err := mc.Set(&memcache.Item{
+			Key:   key,
+			Value: packed,
+		})
+		if err != nil {
+			Error.Printf("Cannot write to memc %s: %v", memc_addr, err)
+			return false
+		}
+	}
+	return true
+
 }
