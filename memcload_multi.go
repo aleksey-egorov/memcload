@@ -1,7 +1,7 @@
 package main
 
 import (
-	"../appsinstalled"
+	"./appsinstalled"
 	"bufio"
 	"compress/gzip"
 	"flag"
@@ -171,6 +171,7 @@ func processFile(filename string, device_memc map[string]string, line_queue chan
 	checkErr(err)
 	defer gr.Close()
 
+	Info.Println("File parsing ")
 	sc := bufio.NewScanner(gr)
 	for sc.Scan() {
 
@@ -225,6 +226,7 @@ func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Sta
 			checkErr(err)
 			errors += 1
 		}
+		Info.Printf("Memc:  %s", item.key)
 		processed += 1
 	}
 	result_queue <- Stats{errors: errors, processed: processed}

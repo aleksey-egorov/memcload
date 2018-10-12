@@ -1,7 +1,7 @@
-package main
+package memcload
 
 import (
-	"./appsinstalled"
+	"../appsinstalled"
 	"bufio"
 	"compress/gzip"
 	"flag"
