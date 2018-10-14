@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -45,6 +46,7 @@ type AppsInstalled struct {
 }
 
 type MemcItem struct {
+	num  int
 	key  string
 	data []byte
 }
@@ -54,39 +56,45 @@ type Stats struct {
 	errors    int
 }
 
+type Line struct {
+	num  int
+	line string
+}
+
 func main() {
 
 	workers := flag.Int("workers", 200, "Number of workers")
 	logfile := flag.String("log", "", "Log file")
 	test := flag.Bool("test", false, "Test mode")
 	dry := flag.Bool("dry", false, "Dry")
-	bufsize := flag.Int("bufsize", 10000, "Buffer size")
+	bufsize := flag.Int("bufsize", 100000, "Buffer size")
 	pattern := flag.String("pattern", "*.tsv.gz", "Pattern")
 	idfa := flag.String("idfa", "35.226.182.234:11211", "")
 	gaid := flag.String("gaid", "35.232.4.163:11211", "")
 	adid := flag.String("adid", "35.226.182.234:11211", "")
 	dvid := flag.String("dvid", "35.232.4.163:11211", "")
-
 	flag.Parse()
 
-	Info = log.New(os.Stdout, "I: ", log.Ldate|log.Ltime|log.Lshortfile)
-	Error = log.New(os.Stdout, "E: ", log.Ldate|log.Ltime|log.Lshortfile)
-	Debug = log.New(os.Stdout, "D: ", log.Ldate|log.Ltime|log.Lshortfile)
-
+	log_output := os.Stdout
 	if *logfile != "" {
 		f, err := os.OpenFile(*logfile, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 		if err != nil {
 			panic(err)
 		}
-
 		defer f.Close()
 		log.SetOutput(f)
+		log_output = f
 	}
+
+	Info = log.New(log_output, "I: ", log.Ldate|log.Ltime|log.Lshortfile)
+	Error = log.New(log_output, "E: ", log.Ldate|log.Ltime|log.Lshortfile)
+	Debug = log.New(os.Stdout, "D: ", log.Ldate|log.Ltime|log.Lshortfile)
 
 	if *test == true {
 		prototest()
 	}
 
+	start_time := time.Now()
 	processFiles(&Job{*pattern,
 		*workers,
 		*bufsize,
@@ -95,6 +103,11 @@ func main() {
 		*adid,
 		*dvid,
 		*dry})
+	stop_time := time.Now()
+	elapsed_time := stop_time.Sub(start_time)
+
+	Info.Printf("Time elapsed: %s sec", elapsed_time)
+	Info.Printf("Work finished")
 }
 
 func checkErr(e error) {
@@ -111,56 +124,80 @@ func processFiles(job *Job) {
 		"adid": job.adid,
 		"dvid": job.dvid,
 	}
+	memc_workers := job.workers
+	line_workers := 4
 
-	Info.Println("Processing pattern ", job.pattern)
+	Info.Printf("Processing pattern %s", job.pattern)
+	Info.Printf("Memc workers: %d, line workers: %d", memc_workers, line_workers)
+
 	files, err := filepath.Glob(job.pattern)
 	checkErr(err)
 
 	result_queue := make(chan Stats)
+	memc_queues := make(map[string]chan *MemcItem)
 
-	memc_queue := make(map[string]chan *MemcItem)
 	for dev_type, memc_addr := range device_memc {
-		memc_queue[dev_type] = make(chan *MemcItem, job.bufsize)
-		mc := memcache.New(memc_addr)
-		mc.Timeout = CONNECTION_TIMEOUT
-		go MemcWorker(mc, memc_queue[dev_type], result_queue)
+		memc_queues[dev_type] = make(chan *MemcItem, job.bufsize)
+		for i := 0; i < memc_workers/4; i++ {
+			mc := memcache.New(memc_addr)
+			mc.Timeout = CONNECTION_TIMEOUT
+			worker_name := fmt.Sprintf("%s_%d", dev_type, i)
+			go MemcWorker(mc, memc_queues[dev_type], result_queue, worker_name)
+			Info.Printf("Starting memc worker %s ", worker_name)
+		}
 	}
 
-	line_queue := make(chan string, job.bufsize)
-	for i := 0; i < job.workers; i++ {
-		go LineWorker(line_queue, memc_queue, result_queue, job.dry)
+	line_queue := make(chan Line, job.bufsize)
+	for i := 0; i < line_workers; i++ {
+		go LineWorker(line_queue, memc_queues, result_queue, job.dry)
+		Info.Printf("Starting line worker %d", i)
 	}
 
 	for _, filename := range files {
-		processed, errors := 0, 0
+
 		processFile(filename, device_memc, line_queue)
 
-		//
-		for i := 0; i < len(result_queue); i++ {
-			results := <-result_queue
-			processed += results.processed
-			errors += results.errors
+		// Wait until queues are empty
+		for {
+			memc_sum := 0
+			line_sum := len(line_queue)
+			for dev_type, _ := range device_memc {
+				memc_sum += len(memc_queues[dev_type])
+			}
+			Info.Printf("Channels: %d %d %d", line_sum, memc_sum, len(result_queue))
+			if line_sum == 0 && memc_sum == 0 {
+				break
+			}
+			time.Sleep(5000000000) // 5 sec
 		}
-
-		err_rate := float32(errors) / float32(processed)
-		if err_rate < NORMAL_ERR_RATE {
-			Info.Printf("Acceptable error rate (%s). Successfull load", err_rate)
-		} else {
-			Error.Printf("High error rate (%s > %s). Failed load", err_rate, NORMAL_ERR_RATE)
-			dotRename(filename)
-		}
-
-		Info.Printf("Channels: %d %d %d", len(line_queue), len(memc_queue), len(result_queue))
+		dotRename(filename)
 	}
 
 	close(line_queue)
-	close(result_queue)
 	for dev_type, _ := range device_memc {
-		close(memc_queue[dev_type])
+		close(memc_queues[dev_type])
 	}
+
+	processed, errors := 0, 0
+	for i := 0; i < len(result_queue); i++ {
+		results := <-result_queue
+		processed += results.processed
+		errors += results.errors
+		Info.Printf("%d: Processed stats %d, Errors: %d", i, results.errors, results.processed)
+	}
+	close(result_queue)
+
+	err_rate := float32(errors) / float32(processed)
+	if err_rate < float32(NORMAL_ERR_RATE) {
+		Info.Printf("Acceptable error rate (%d). Successfull load", err_rate)
+	} else {
+		Error.Printf("High error rate (%f > %f). Failed load", err_rate, float32(NORMAL_ERR_RATE))
+
+	}
+
 }
 
-func processFile(filename string, device_memc map[string]string, line_queue chan string) {
+func processFile(filename string, device_memc map[string]string, line_queue chan Line) {
 
 	Info.Println("File ", filename)
 	f, err := os.Open(filename)
@@ -173,26 +210,28 @@ func processFile(filename string, device_memc map[string]string, line_queue chan
 
 	Info.Println("File parsing ")
 	sc := bufio.NewScanner(gr)
+	line_num := 0
 	for sc.Scan() {
 
 		line := sc.Text()
 		line = strings.Trim(line, " ")
 
-		line_queue <- line
+		line_queue <- Line{num: line_num, line: line}
+		line_num += 1
 	}
 }
 
-func LineWorker(lines chan string, memc_queue map[string]chan *MemcItem, result_queue chan Stats, dry bool) {
+func LineWorker(lines chan Line, memc_queue map[string]chan *MemcItem, result_queue chan Stats, dry bool) {
 	errors := 0
 
 	for line := range lines {
-		appsinstalled := parseAppsInstalled(line)
+		appsinstalled := parseAppsInstalled(line.line)
 		if appsinstalled == nil {
 			errors += 1
 			continue
 		}
 
-		item, err := makeMemcItem(appsinstalled)
+		item, err := makeMemcItem(appsinstalled, line.num)
 		if err != nil {
 			errors += 1
 			Error.Println("Cant make MemcItem: ", err)
@@ -207,7 +246,7 @@ func LineWorker(lines chan string, memc_queue map[string]chan *MemcItem, result_
 		}
 
 		if dry {
-			Debug.Println("%s", item.key)
+			Debug.Printf("%d: Fake add %s", item.num, item.key)
 		} else {
 			queue <- item
 		}
@@ -215,9 +254,10 @@ func LineWorker(lines chan string, memc_queue map[string]chan *MemcItem, result_
 	result_queue <- Stats{errors: errors}
 }
 
-func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Stats) {
+func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Stats, worker_name string) {
 	processed, errors := 0, 0
-	for item := range items {
+	for {
+		item := <-items
 		err := mc.Set(&memcache.Item{
 			Key:   item.key,
 			Value: item.data,
@@ -225,10 +265,16 @@ func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Sta
 		if err != nil {
 			checkErr(err)
 			errors += 1
+		} else {
+			//Debug.Printf("%d: Worker %s - memc added %s", item.num, worker_name, item.key)
+			Debug.Printf("%d: Worker %s: key=%s, processed=%d, errors=%d, range=%d", item.num, worker_name, item.key, processed, errors, len(items))
+			processed += 1
 		}
-		Info.Printf("Memc:  %s", item.key)
-		processed += 1
+		if len(items) == 0 {
+			break
+		}
 	}
+	Info.Printf("Worker %s: final memc processed %d, errors %d", worker_name, processed, errors)
 	result_queue <- Stats{errors: errors, processed: processed}
 }
 
@@ -302,7 +348,7 @@ func parseAppsInstalled(str string) *AppsInstalled {
 	return &AppsInstalled{dev_type, dev_id, lat, lon, apps}
 }
 
-func makeMemcItem(apps_installed *AppsInstalled) (*MemcItem, error) {
+func makeMemcItem(apps_installed *AppsInstalled, num int) (*MemcItem, error) {
 	ua := &appsinstalled.UserApps{
 		Lat:  proto.Float64(apps_installed.lat),
 		Lon:  proto.Float64(apps_installed.lon),
@@ -313,5 +359,5 @@ func makeMemcItem(apps_installed *AppsInstalled) (*MemcItem, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &MemcItem{key, packed}, nil
+	return &MemcItem{num, key, packed}, nil
 }
