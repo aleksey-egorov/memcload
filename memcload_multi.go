@@ -133,7 +133,7 @@ func processFiles(job *Job) {
 	files, err := filepath.Glob(job.pattern)
 	checkErr(err)
 
-	result_queue := make(chan Stats)
+	result_queue := make(chan Stats, 1000000)
 	memc_queues := make(map[string]chan *MemcItem)
 
 	for dev_type, memc_addr := range device_memc {
@@ -154,23 +154,22 @@ func processFiles(job *Job) {
 	}
 
 	for _, filename := range files {
-
-		processFile(filename, device_memc, line_queue)
-
-		// Wait until queues are empty
-		for {
-			memc_sum := 0
-			line_sum := len(line_queue)
-			for dev_type, _ := range device_memc {
-				memc_sum += len(memc_queues[dev_type])
-			}
-			Info.Printf("Channels: %d %d %d", line_sum, memc_sum, len(result_queue))
-			if line_sum == 0 && memc_sum == 0 {
-				break
-			}
-			time.Sleep(5000000000) // 5 sec
-		}
+		processFile(filename, line_queue)
 		dotRename(filename)
+	}
+
+	// Wait until queues are empty
+	for {
+		memc_sum := 0
+		line_sum := len(line_queue)
+		for dev_type, _ := range device_memc {
+			memc_sum += len(memc_queues[dev_type])
+		}
+		Info.Printf("Channels: line=%d memc=%d result=%d", line_sum, memc_sum, len(result_queue))
+		if line_sum == 0 && memc_sum == 0 {
+			break
+		}
+		time.Sleep(5000000000) // 5 sec
 	}
 
 	close(line_queue)
@@ -183,21 +182,20 @@ func processFiles(job *Job) {
 		results := <-result_queue
 		processed += results.processed
 		errors += results.errors
-		Info.Printf("%d: Processed stats %d, Errors: %d", i, results.errors, results.processed)
 	}
+	Info.Printf("Final stats: processed=%d, errors=%d", processed, errors)
 	close(result_queue)
 
 	err_rate := float32(errors) / float32(processed)
 	if err_rate < float32(NORMAL_ERR_RATE) {
-		Info.Printf("Acceptable error rate (%d). Successfull load", err_rate)
+		Info.Printf("Acceptable error rate (%f). Successfull load", err_rate)
 	} else {
 		Error.Printf("High error rate (%f > %f). Failed load", err_rate, float32(NORMAL_ERR_RATE))
-
 	}
 
 }
 
-func processFile(filename string, device_memc map[string]string, line_queue chan Line) {
+func processFile(filename string, line_queue chan Line) {
 
 	Info.Println("File ", filename)
 	f, err := os.Open(filename)
@@ -252,6 +250,7 @@ func LineWorker(lines chan Line, memc_queue map[string]chan *MemcItem, result_qu
 		}
 	}
 	result_queue <- Stats{errors: errors}
+	Info.Printf("LineWorker: final errors %d, queue %d", errors, len(result_queue))
 }
 
 func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Stats, worker_name string) {
@@ -266,16 +265,21 @@ func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Sta
 			checkErr(err)
 			errors += 1
 		} else {
-			//Debug.Printf("%d: Worker %s - memc added %s", item.num, worker_name, item.key)
-			Debug.Printf("%d: Worker %s: key=%s, processed=%d, errors=%d, range=%d", item.num, worker_name, item.key, processed, errors, len(items))
+			//Debug.Printf("%d: MemcWorker %s: key=%s, processed=%d, errors=%d, memc_chan=%d res_chan=%d", item.num, worker_name, item.key, processed, errors, len(items), len(result_queue))
 			processed += 1
 		}
 		if len(items) == 0 {
 			break
 		}
+		if processed > 1000 || errors > 1000 {
+			result_queue <- Stats{errors: errors, processed: processed}
+			//Info.Printf("%d: MemcWorker %s: channels: memc=%d res=%d", item.num, worker_name, len(items), len(result_queue))
+			processed = 0
+			errors = 0
+		}
 	}
-	Info.Printf("Worker %s: final memc processed %d, errors %d", worker_name, processed, errors)
 	result_queue <- Stats{errors: errors, processed: processed}
+	Info.Printf("MemcWorker %s: final processed %d, errors %d, queue %d", worker_name, processed, errors, len(result_queue))
 }
 
 func prototest() {
