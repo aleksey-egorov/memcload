@@ -191,14 +191,6 @@ func processFiles(job *Job) {
 	}
 	Info.Printf("Total: processed=%d, errors=%d", processed, errors)
 
-	//
-	//memc_sum := 0
-	//line_sum := len(line_queue)
-	//for dev_type, _ := range device_memc {
-	//		memc_sum += len(memc_queues[dev_type])
-	//}
-	//Info.Printf("Channels final: line=%d memc=%d result=%d", line_sum, memc_sum, len(result_queue))
-
 	err_rate := float32(errors) / float32(processed)
 	if err_rate < float32(NORMAL_ERR_RATE) {
 		Info.Printf("Acceptable error rate (%f). Successfull load", err_rate)
@@ -209,7 +201,6 @@ func processFiles(job *Job) {
 	for dev_type, _ := range device_memc {
 		close(memc_queues[dev_type])
 	}
-	//close(result_queue)
 	close(line_queue)
 
 }
