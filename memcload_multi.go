@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,7 +25,7 @@ var (
 )
 
 const NORMAL_ERR_RATE = 0.01
-const CONNECTION_TIMEOUT = 2000000000 // in nanoseconds, this equals to 2 sec
+const CONNECTION_TIMEOUT = 5
 
 type Job struct {
 	pattern  string
@@ -71,10 +72,10 @@ func main() {
 	dry := flag.Bool("dry", false, "Dry")
 	bufsize := flag.Int("bufsize", 100000, "Buffer size")
 	pattern := flag.String("pattern", "*.tsv.gz", "Pattern")
-	idfa := flag.String("idfa", "35.226.182.234:11211", "")
-	gaid := flag.String("gaid", "35.232.4.163:11211", "")
-	adid := flag.String("adid", "35.226.182.234:11211", "")
-	dvid := flag.String("dvid", "35.232.4.163:11211", "")
+	idfa := flag.String("idfa", "35.238.204.0:11211", "")
+	gaid := flag.String("gaid", "107.178.221.100:11211", "")
+	adid := flag.String("adid", "35.238.204.0:11211", "")
+	dvid := flag.String("dvid", "107.178.221.100:11211", "")
 	flag.Parse()
 
 	log_output := os.Stdout
@@ -121,73 +122,42 @@ func checkErr(e error) {
 
 func processFiles(job *Job) {
 
+	wg := &sync.WaitGroup{}
+
 	device_memc := map[string]string{
 		"idfa": job.idfa,
 		"gaid": job.gaid,
 		"adid": job.adid,
 		"dvid": job.dvid,
 	}
-	memc_workers := job.mworkers
-	line_workers := job.lworkers
+
+	memc_workers_dev := job.mworkers / len(device_memc) // Memc workers are divided into groups equally
 
 	Info.Printf("Processing pattern %s", job.pattern)
-	Info.Printf("Memc workers: %d, line workers: %d", memc_workers, line_workers)
+	Info.Printf("Memc workers per dev: %d, line workers: %d", memc_workers_dev, job.lworkers)
 
 	files, err := filepath.Glob(job.pattern)
 	checkErr(err)
 
 	line_queue := make(chan Line, job.bufsize)
 	memc_queues := make(map[string]chan *MemcItem)
-	result_queue := make(chan Stats, 1000000)
+	result_queue := make(chan Stats, job.bufsize)
 
-	// Line workers: read strings from line_queue, prepare packages and send them to memc_queues
-	for i := 0; i < line_workers; i++ {
-		go LineWorker(line_queue, memc_queues, result_queue, job.dry)
-		Info.Printf("Starting line worker %d", i)
-	}
+	startLineWorkers(job.lworkers, line_queue, memc_queues, result_queue, job.dry)
+	startMemcWorkers(memc_workers_dev, memc_queues, result_queue, device_memc, job.bufsize, wg)
 
-	// Memc workers: read packages from memc_queues and send them to Memcache server
-	for dev_type, memc_addr := range device_memc {
-		memc_queues[dev_type] = make(chan *MemcItem, job.bufsize)
-		for i := 0; i < memc_workers/4; i++ {
-			mc := memcache.New(memc_addr)
-			mc.Timeout = CONNECTION_TIMEOUT
-			worker_name := fmt.Sprintf("%s_%d", dev_type, i)
-			go MemcWorker(mc, memc_queues[dev_type], result_queue, worker_name)
-			Info.Printf("Starting memc worker %s ", worker_name)
-		}
-	}
-
-	// Processing files
 	for _, filename := range files {
-		processFile(filename, line_queue)
-		dotRename(filename)
+		go ProcessFile(filename, line_queue)
 	}
+	Info.Println("Waiting ... ")
+	wg.Wait()
 
-	// Waiting until all tasks are finished
-	for {
-		memc_sum := 0
-		line_sum := len(line_queue)
-		for dev_type, _ := range device_memc {
-			memc_sum += len(memc_queues[dev_type])
-		}
-		Info.Printf("Channels: line=%d memc=%d result=%d", line_sum, memc_sum, len(result_queue))
-		time.Sleep(10000000000) // 10 sec
-
-		if line_sum == 0 && memc_sum == 0 {
-			break
-		}
-	}
-
-	// Calculating stats
+	result_count := len(result_queue)
 	processed, errors := 0, 0
-	for {
+	for i := 0; i < result_count; i++ {
 		results := <-result_queue
 		processed += results.processed
 		errors += results.errors
-		if len(result_queue) == 0 {
-			break
-		}
 	}
 	Info.Printf("Total: processed=%d, errors=%d", processed, errors)
 
@@ -198,14 +168,40 @@ func processFiles(job *Job) {
 		Error.Printf("High error rate (%f > %f). Failed load", err_rate, float32(NORMAL_ERR_RATE))
 	}
 
+	for _, filename := range files {
+		dotRename(filename)
+	}
+
 	for dev_type, _ := range device_memc {
 		close(memc_queues[dev_type])
 	}
 	close(line_queue)
-
 }
 
-func processFile(filename string, line_queue chan Line) {
+func startLineWorkers(line_workers int, line_queue chan Line, memc_queues map[string]chan *MemcItem,
+	result_queue chan Stats, dry bool) {
+	for i := 0; i < line_workers; i++ {
+		go LineWorker(line_queue, memc_queues, result_queue, dry)
+		Info.Printf("Starting line worker %d", i)
+	}
+}
+
+func startMemcWorkers(memc_workers_dev int, memc_queues map[string]chan *MemcItem, result_queue chan Stats,
+	device_memc map[string]string, bufsize int, wg *sync.WaitGroup) {
+	for dev_type, memc_addr := range device_memc {
+		memc_queues[dev_type] = make(chan *MemcItem, bufsize)
+		for i := 0; i < memc_workers_dev; i++ {
+			mc := memcache.New(memc_addr)
+			mc.Timeout = CONNECTION_TIMEOUT * time.Second
+			wg.Add(1)
+			worker_name := fmt.Sprintf("%s_%d", dev_type, i)
+			go MemcWorker(mc, memc_queues[dev_type], result_queue, worker_name, wg)
+			Info.Printf("Starting memc worker %s ", worker_name)
+		}
+	}
+}
+
+func ProcessFile(filename string, line_queue chan Line) {
 
 	Info.Println("File ", filename)
 	f, err := os.Open(filename)
@@ -216,7 +212,6 @@ func processFile(filename string, line_queue chan Line) {
 	checkErr(err)
 	defer gr.Close()
 
-	Info.Println("File parsing ")
 	sc := bufio.NewScanner(gr)
 	line_num := 0
 	for sc.Scan() {
@@ -262,8 +257,9 @@ func LineWorker(lines chan Line, memc_queue map[string]chan *MemcItem, result_qu
 	Info.Printf("LineWorker: final errors %d, queue %d", errors, len(result_queue))
 }
 
-func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Stats, worker_name string) {
+func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Stats, worker_name string, wg *sync.WaitGroup) {
 	processed, errors := 0, 0
+	defer wg.Done()
 	for {
 		item := <-items
 		err := mc.Set(&memcache.Item{
@@ -279,11 +275,12 @@ func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Sta
 		if len(items) == 0 {
 			break
 		}
+
 		if processed > 1000 || errors > 1000 {
 			result_queue <- Stats{errors: errors, processed: processed}
-			//Debug.Printf("%d: MemcWorker %s: channels: memc=%d res=%d", item.num, worker_name, len(items), len(result_queue))
 			processed = 0
 			errors = 0
+			Debug.Printf("%d: MemcWorker %s send stats: proc=%d, channels: memc=%d res=%d", item.num, worker_name, processed, len(items), len(result_queue))
 		}
 	}
 	result_queue <- Stats{errors: errors, processed: processed}
