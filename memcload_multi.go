@@ -4,6 +4,7 @@ import (
 	"./appsinstalled"
 	"bufio"
 	"compress/gzip"
+	"errors"
 	"flag"
 	"fmt"
 	"github.com/bradfitz/gomemcache/memcache"
@@ -120,9 +121,11 @@ func checkErr(e error) {
 	}
 }
 
-func processFiles(job *Job) {
+func processFiles(job *Job) error {
 
-	wg := &sync.WaitGroup{}
+	fwg := &sync.WaitGroup{}
+	lwg := &sync.WaitGroup{}
+	mwg := &sync.WaitGroup{}
 
 	device_memc := map[string]string{
 		"idfa": job.idfa,
@@ -137,20 +140,31 @@ func processFiles(job *Job) {
 	Info.Printf("Memc workers per dev: %d, line workers: %d", memc_workers_dev, job.lworkers)
 
 	files, err := filepath.Glob(job.pattern)
-	checkErr(err)
+	if err != nil {
+		Error.Printf("Could not find files for the given pattern: %s", job.pattern)
+		return err
+	}
 
 	line_queue := make(chan Line, job.bufsize)
 	memc_queues := make(map[string]chan *MemcItem)
 	result_queue := make(chan Stats, job.bufsize)
 
-	startLineWorkers(job.lworkers, line_queue, memc_queues, result_queue, job.dry)
-	startMemcWorkers(memc_workers_dev, memc_queues, result_queue, device_memc, job.bufsize, wg)
+	startFileWorkers(files, line_queue, fwg)
+	startLineWorkers(job.lworkers, line_queue, memc_queues, result_queue, job.dry, lwg)
+	startMemcWorkers(memc_workers_dev, memc_queues, result_queue, device_memc, job.bufsize, mwg)
 
-	for _, filename := range files {
-		go ProcessFile(filename, line_queue)
+	fwg.Wait()
+	Info.Printf("File workers finished their tasks")
+	close(line_queue)
+
+	lwg.Wait()
+	Info.Printf("Line workers finished their tasks")
+	for dev_type, _ := range device_memc {
+		close(memc_queues[dev_type])
 	}
-	Info.Println("Waiting ... ")
-	wg.Wait()
+
+	mwg.Wait()
+	Info.Printf("Memc workers finished their tasks")
 
 	result_count := len(result_queue)
 	processed, errors := 0, 0
@@ -159,8 +173,12 @@ func processFiles(job *Job) {
 		processed += results.processed
 		errors += results.errors
 	}
-	Info.Printf("Total: processed=%d, errors=%d", processed, errors)
+	Info.Printf("Total: processed=%d, errors=%d, result_queue=%d", processed, errors, len(result_queue))
 
+	if processed == 0 {
+		Error.Printf("No data processed, check file format")
+		return nil
+	}
 	err_rate := float32(errors) / float32(processed)
 	if err_rate < float32(NORMAL_ERR_RATE) {
 		Info.Printf("Acceptable error rate (%f). Successfull load", err_rate)
@@ -171,65 +189,83 @@ func processFiles(job *Job) {
 	for _, filename := range files {
 		dotRename(filename)
 	}
+	close(result_queue)
 
-	for dev_type, _ := range device_memc {
-		close(memc_queues[dev_type])
+	return nil
+}
+
+func startFileWorkers(files []string, line_queue chan Line, fwg *sync.WaitGroup) {
+	for _, filename := range files {
+		fwg.Add(1)
+		go ProcessFile(filename, line_queue, fwg)
 	}
-	close(line_queue)
 }
 
 func startLineWorkers(line_workers int, line_queue chan Line, memc_queues map[string]chan *MemcItem,
-	result_queue chan Stats, dry bool) {
+	result_queue chan Stats, dry bool, lwg *sync.WaitGroup) {
 	for i := 0; i < line_workers; i++ {
-		go LineWorker(line_queue, memc_queues, result_queue, dry)
+		lwg.Add(1)
+		go LineWorker(line_queue, memc_queues, result_queue, dry, lwg)
 		Info.Printf("Starting line worker %d", i)
 	}
 }
 
 func startMemcWorkers(memc_workers_dev int, memc_queues map[string]chan *MemcItem, result_queue chan Stats,
-	device_memc map[string]string, bufsize int, wg *sync.WaitGroup) {
+	device_memc map[string]string, bufsize int, mwg *sync.WaitGroup) {
 	for dev_type, memc_addr := range device_memc {
 		memc_queues[dev_type] = make(chan *MemcItem, bufsize)
 		for i := 0; i < memc_workers_dev; i++ {
 			mc := memcache.New(memc_addr)
 			mc.Timeout = CONNECTION_TIMEOUT * time.Second
-			wg.Add(1)
+			mwg.Add(1)
 			worker_name := fmt.Sprintf("%s_%d", dev_type, i)
-			go MemcWorker(mc, memc_queues[dev_type], result_queue, worker_name, wg)
+			go MemcWorker(mc, memc_queues[dev_type], result_queue, worker_name, mwg)
 			Info.Printf("Starting memc worker %s ", worker_name)
 		}
 	}
 }
 
-func ProcessFile(filename string, line_queue chan Line) {
-
+func ProcessFile(filename string, line_queue chan Line, fwg *sync.WaitGroup) error {
+	defer fwg.Done()
 	Info.Println("File ", filename)
 	f, err := os.Open(filename)
-	checkErr(err)
+	if err != nil {
+		Error.Printf("Can't open file: %s", filename)
+		return err
+	}
 	defer f.Close()
 
 	gr, err := gzip.NewReader(f)
-	checkErr(err)
+	if err != nil {
+		Error.Printf("Can't open gzip Reader %v", err)
+		return err
+	}
 	defer gr.Close()
 
 	sc := bufio.NewScanner(gr)
 	line_num := 0
 	for sc.Scan() {
-
 		line := sc.Text()
 		line = strings.Trim(line, " ")
-
 		line_queue <- Line{num: line_num, line: line}
 		line_num += 1
 	}
+	if err := sc.Err(); err != nil {
+		Error.Printf("Bufio scanner error: %v", err)
+		return err
+	}
+
+	return nil
 }
 
-func LineWorker(lines chan Line, memc_queue map[string]chan *MemcItem, result_queue chan Stats, dry bool) {
+func LineWorker(lines chan Line, memc_queue map[string]chan *MemcItem, result_queue chan Stats, dry bool, lwg *sync.WaitGroup) {
 	errors := 0
+	defer lwg.Done()
 	for line := range lines {
-		appsinstalled := parseAppsInstalled(line.line)
+		appsinstalled, err := parseAppsInstalled(line.line)
 		if appsinstalled == nil {
 			errors += 1
+			Error.Println("Parsing AppsInstalle error: ", err)
 			continue
 		}
 
@@ -257,41 +293,39 @@ func LineWorker(lines chan Line, memc_queue map[string]chan *MemcItem, result_qu
 	Info.Printf("LineWorker: final errors %d, queue %d", errors, len(result_queue))
 }
 
-func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Stats, worker_name string, wg *sync.WaitGroup) {
+func MemcWorker(mc *memcache.Client, items chan *MemcItem, result_queue chan Stats, worker_name string,
+	mwg *sync.WaitGroup) {
 	processed, errors := 0, 0
-	defer wg.Done()
-	for {
-		item := <-items
+	defer mwg.Done()
+	for item := range items {
 		err := mc.Set(&memcache.Item{
 			Key:   item.key,
 			Value: item.data,
 		})
 		if err != nil {
-			checkErr(err)
+			Error.Println("Error writing to Memcached: ", err)
 			errors += 1
 		} else {
 			processed += 1
-		}
-		if len(items) == 0 {
-			break
 		}
 
 		if processed > 1000 || errors > 1000 {
 			result_queue <- Stats{errors: errors, processed: processed}
 			processed = 0
 			errors = 0
-			Debug.Printf("%d: MemcWorker %s send stats: proc=%d, channels: memc=%d res=%d", item.num, worker_name, processed, len(items), len(result_queue))
+			Debug.Printf("%d: MemcWorker %s: proc=%d, channels: memc=%d res=%d", item.num, worker_name, processed, len(items), len(result_queue))
 		}
 	}
 	result_queue <- Stats{errors: errors, processed: processed}
-	Info.Printf("MemcWorker %s: final processed %d, errors %d, queue %d", worker_name, processed, errors, len(result_queue))
+	Info.Printf("MemcWorker %s: final proc=%d, err=%d, channels: memc=%d res=%d", worker_name, processed, errors, len(items), len(result_queue))
 }
 
 func prototest() {
 	Info.Println("Starting test ... ")
 	sample := "idfa\t1rfw452y52g2gq4g\t55.55\t42.42\t1423,43,567,3,7,23\ngaid\t7rfw452y52g2gq4g\t55.55\t42.42\t7423,424"
 	for _, line := range strings.Split(sample, "\n") {
-		apps_installed := parseAppsInstalled(line)
+		apps_installed, err := parseAppsInstalled(line)
+		checkErr(err)
 		ua := &appsinstalled.UserApps{
 			Lat:  proto.Float64(apps_installed.lat),
 			Lon:  proto.Float64(apps_installed.lon),
@@ -313,15 +347,17 @@ func prototest() {
 	}
 }
 
-func dotRename(path string) {
+func dotRename(path string) error {
 	head := filepath.Dir(path)
 	fn := filepath.Base(path)
 	if err := os.Rename(path, filepath.Join(head, "."+fn)); err != nil {
 		Error.Printf("Can't rename a file: %s", path)
+		return err
 	}
+	return nil
 }
 
-func parseAppsInstalled(str string) *AppsInstalled {
+func parseAppsInstalled(str string) (*AppsInstalled, error) {
 
 	var apps []uint32
 
@@ -329,7 +365,7 @@ func parseAppsInstalled(str string) *AppsInstalled {
 	line_parts := strings.Split(str, "\t")
 
 	if len(line_parts) < 5 {
-		return nil
+		return nil, errors.New("Some line parts missing")
 	}
 
 	dev_type := line_parts[0]
@@ -339,22 +375,28 @@ func parseAppsInstalled(str string) *AppsInstalled {
 	raw_apps := line_parts[4]
 
 	if dev_type == "" || dev_id == "" {
-		return nil
+		return nil, errors.New("dev_type or dev_id missing")
 	}
 	parts := strings.Split(raw_apps, ",")
 	for _, a := range parts {
 		a = strings.TrimSpace(a)
 		digit, err := strconv.Atoi(a)
-		checkErr(err)
+		if err != nil {
+			return nil, err
+		}
 		apps = append(apps, uint32(digit))
 	}
 
 	lat, err := strconv.ParseFloat(lat_str, 8)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 	lon, err := strconv.ParseFloat(lon_str, 8)
-	checkErr(err)
+	if err != nil {
+		return nil, err
+	}
 
-	return &AppsInstalled{dev_type, dev_id, lat, lon, apps}
+	return &AppsInstalled{dev_type, dev_id, lat, lon, apps}, nil
 }
 
 func makeMemcItem(apps_installed *AppsInstalled, num int) (*MemcItem, error) {
